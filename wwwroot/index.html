@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<link rel="stylesheet" href="site.css">
+    <title>Simple Chat</title>
+</head>
+<body>
+    <h1 id="title">Simple Chat</h1>
+
+    <form id="message-form">
+        <input
+            type="text"
+            id="username"
+            name="username"
+            placeholder="Username"
+            required
+        >
+
+        <input
+            type="text"
+            id="message"
+            name="message"
+            placeholder="Message"
+            required
+        >
+
+        <button id="myButton" type="submit">Send</button>
+    </form>
+
+    <ul id="messages"></ul>
+	<script src="site.js"></script>
+</body>
+</html>
