@@ -26,8 +26,23 @@
             required
         >
 
+        <label>
+            <input type="checkbox" id="send-to-group">
+            Send to group
+        </label>
+
         <button id="myButton" type="submit">Send</button>
     </form>
+
+	<form id="group-form">
+		<input
+			type="text"
+			id="group-name"
+			placeholder="Group name"
+			required
+		>
+		<button type="submit">Join Group</button>
+	</form>
 
     <ul id="messages"></ul>
 	<script src="lib/signalr/signalr.min.js"></script>

@@ -252,3 +252,270 @@ dotnet run -p:AllowMissingPrunePackageData=true
 ```
 
 If that issue comes back, the project may need a more permanent SDK/runtime fix later.
+
+## Lifecycle & Groups (next step, done)
+
+Hub instance is still **per-invocation / stateless**. Lifecycle hooks run once per connection, not per call.
+
+### `OnConnectedAsync` / `OnDisconnectedAsync`
+
+```csharp
+public override async Task OnConnectedAsync()
+{
+	await Clients.Others.SendAsync("SystemMessage", $"{Context.ConnectionId} connected");
+	await base.OnConnectedAsync();
+}
+```
+
+- Run once per connection connect/disconnect.
+- `Context.ConnectionId` — opaque, unique per connection, regenerated each connect. Not a permanent identity.
+- `base.OnConnectedAsync()` — required; lets SignalR finish setup.
+
+### Groups
+
+```csharp
+await Groups.AddToGroupAsync(Context.ConnectionId, group);       // join
+await Groups.RemoveFromGroupAsync(Context.ConnectionId, group);  // leave
+await Clients.Group(group).SendAsync("ReceiveMessage", user, message);  // broadcast to one group
+```
+
+- Groups live while the connection lives. On disconnect the server auto-removes the connection from all groups — no manual cleanup.
+- `Clients.Group(...)` targets only members, unlike `Clients.All`.
+
+### Client selector table
+
+| Selector | Meaning |
+|---|---|
+| `Clients.All` | every connection |
+| `Clients.Others` | all except caller |
+| `Clients.Caller` | only caller |
+| `Clients.Group("name")` | only group members |
+| `Clients.Client(id)` | one connection by id |
+
+### State gotcha
+
+Any counter/tracker (e.g. online users) cannot live in a hub field — hub is destroyed per invocation. Needs a singleton service injected via DI.
+
+### New touch points (names must align)
+
+| Action | Server | Client |
+|---|---|---|
+| join | `JoinGroup(string group)` | `invoke('JoinGroup', g)` |
+| leave | `LeaveGroup(string group)` | `invoke('LeaveGroup', g)` |
+| group send | `SendToGroup(group, user, msg)` | `invoke('SendToGroup', ...)` |
+| system msg | `SendAsync("SystemMessage", ...)` | `on('SystemMessage', ...)` |
+
+### UI: `#send-to-group` checkbox
+
+- Checked + group name present → invokes `SendToGroup`, only group members receive.
+- Unchecked → `SendMessage`, everyone receives.
+
+## Planned next study steps
+
+### 1. `LeaveGroup` on the UI trigger (gap in current app)
+
+Server method already exists:
+
+```csharp
+public async Task LeaveGroup(string group)
+{
+	await Groups.RemoveFromGroupAsync(Context.ConnectionId, group);
+	await Clients.Group(group).SendAsync("SystemMessage", $"{Context.ConnectionId} left {group}");
+}
+```
+
+But nothing in `site.js` calls it. To wire it up:
+
+```javascript
+// site.js — new button handler
+const leaveForm = document.getElementById('leave-form')  // or a toggle button
+leaveForm.addEventListener('submit', async (e) => {
+	e.preventDefault()
+	const g = groupName.value.trim()
+	if (!g) return
+	await connection.invoke('LeaveGroup', g)
+})
+```
+
+```html
+<!-- index.html — add a Leave button next to Join Group -->
+<button id="leave-btn" type="button">Leave Group</button>
+```
+
+```javascript
+document.getElementById('leave-btn').addEventListener('click', async () => {
+	const g = groupName.value.trim()
+	if (!g) return
+	await connection.invoke('LeaveGroup', g)
+})
+```
+
+Touch point: server `LeaveGroup(string group)` ↔ client `invoke('LeaveGroup', g)`.
+
+### 2. State via DI
+
+Problem recap: hub is per-invocation. A counter in a hub field resets on every call. Long-lived state must live in a singleton service, injected into the hub constructor.
+
+```csharp
+// Services/UserTracker.cs
+public class UserTracker
+{
+	private readonly HashSet<string> _connections = new();
+	public int Count => _connections.Count;
+	public bool Add(string id) => _connections.Add(id);
+	public bool Remove(string id) => _connections.Remove(id);
+}
+```
+
+Register as singleton in `Program.cs`:
+
+```csharp
+builder.Services.AddSingleton<UserTracker>();
+```
+
+Inject into the hub:
+
+```csharp
+public class ChatHub : Hub
+{
+	private readonly UserTracker _tracker;
+
+	public ChatHub(UserTracker tracker) => _tracker = tracker;
+
+	public override async Task OnConnectedAsync()
+	{
+		_tracker.Add(Context.ConnectionId);
+		await Clients.All.SendAsync("UserCount", _tracker.Count);  // push count to everyone
+		await base.OnConnectedAsync();
+	}
+
+	public override async Task OnDisconnectedAsync(Exception? exception)
+	{
+		_tracker.Remove(Context.ConnectionId);
+		await Clients.All.SendAsync("UserCount", _tracker.Count);
+		await base.OnDisconnectedAsync(exception);
+	}
+}
+```
+
+Client side:
+
+```javascript
+connection.on('UserCount', (count) => {
+	document.getElementById('online-count').textContent = count
+})
+```
+
+Key points:
+
+- Singleton + `lock` or concurrent collections needed if the tracker mutates concurrently. `HashSet` from two hub invocations on different threads = race → use `ConcurrentDictionary` or `lock`.
+- A method like `GetOnlineCount()` can also be invoked directly by the client (`invoke('GetOnlineCount')` returns a value back).
+
+Push-outside-a-hub pattern: to update the UI from non-hub code (a background service, a controller), inject `IHubContext<ChatHub>`:
+
+```csharp
+public class SomeService
+{
+	private readonly IHubContext<ChatHub> _hub;
+	public SomeService(IHubContext<ChatHub> hub) => _hub = hub;
+
+	public async Task Notify(string msg) =>
+		await _hub.Clients.All.SendAsync("SystemMessage", msg);
+}
+```
+
+`IHubContext` has no request/connection context — only `Clients`, `Groups`, `Context` info via user/connection. That is the trade-off.
+
+### 3. Connection resilience
+
+Current `site.js` starts once with a raw catch:
+
+```javascript
+connection.start().catch((err) => console.error(err))
+```
+
+If the network blips, the connection dies and never returns. Add auto-reconnect and lifecycle events.
+
+```javascript
+const connection = new signalR.HubConnectionBuilder()
+	.withUrl("/chatHub")
+	.withAutomaticReconnect()                       // retry: 0s, 2s, 10s, 30s then stop
+	.configureLogging(signalR.LogLevel.Information)
+	.build()
+
+connection.onreconnecting((err) => {
+	console.log('reconnecting', err)
+	// show status: "Reconnecting..."
+})
+
+connection.onreconnected((connectionId) => {
+	console.log('reconnected', connectionId)
+	// show status: "Connected"
+})
+
+connection.onclose(() => {
+	console.log('connection closed')
+	// show status: "Disconnected"
+})
+
+connection.start()
+	.then(() => console.log('connected'))
+	.catch((err) => console.error(err))
+```
+
+Gotchas:
+
+- `.withAutomaticReconnect()` — takes an optional array of delays in ms, default `[0, 2000, 10000, 30000]`. After the last attempt it gives up and fires `onclose`.
+- `onreconnected` receives the new `connectionId` — it changes after reconnect. Do not treat it as identity (matches the opaque-ConnectionId note).
+- Server state is lost on disconnect/reconnect: groups are auto-removed. If the app depends on group membership, the client must re-join after `onreconnected`.
+- Custom reconnect: pass `IReconnectPolicy` on server or delays array on client.
+- If `invoke` fails while reconnecting, it throws — guard sends with connection state check or retry.
+
+### 4. Typed clients
+
+Current code uses magic strings on both sides — a typo in `"ReceiveMessage"` fails silently at runtime. Typed hubs replace the string broadcast target with an interface method.
+
+```csharp
+// Hubs/IChatClient.cs
+namespace SignalR.Hubs;
+
+public interface IChatClient
+{
+	Task ReceiveMessage(string user, string message);
+	Task SystemMessage(string text);
+}
+```
+
+Hub implements the typed version:
+
+```csharp
+public class ChatHub : Hub<IChatClient>
+{
+	public override async Task OnConnectedAsync()
+	{
+		await Clients.Others.SystemMessage($"{Context.ConnectionId} connected");  // no SendAsync string
+		await base.OnConnectedAsync();
+	}
+
+	public async Task SendMessage(string user, string message)
+	{
+		await Clients.All.ReceiveMessage(user, message);
+	}
+}
+```
+
+Key changes:
+
+- `Hub<IChatClient>` — the interface replaces the magic broadcast target.
+- `Clients.All.ReceiveMessage(...)` — compiler-checked call. A wrong method name = build error, not silent runtime failure.
+- Client side is unchanged: still `connection.on('ReceiveMessage', ...)` — the JS handler name must match the interface method name.
+- The interface only types the **server→client** direction. Client→server (`invoke`) still maps by method name on the hub class.
+
+Trade-off: the JS side still has strings — typing only protects the server half. Interface methods must stay async-`Task`.
+
+### Recommended order
+
+1. Wire `LeaveGroup` button (small, closes a gap)
+2. State via DI (fills statelessness hole, teaches DI + `IHubContext`)
+3. Typed clients (kills magic strings server-side)
+4. Connection resilience (robustness, works well with typed clients re-joining groups on reconnect)
