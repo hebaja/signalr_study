@@ -130,6 +130,119 @@ That gives you a basic chat app and introduces the core SignalR flow:
 - hub connection
 - server broadcast
 
+## Breakdown: `Hubs/ChatHub.cs`
+
+```csharp
+using Microsoft.AspNetCore.SignalR;
+
+namespace SignalR.Hubs;
+
+public class ChatHub : Hub
+{
+	public async Task SendMessage(string user, string message)
+	{
+		await Clients.All.SendAsync("ReceiveMessage", user, message);
+	}
+}
+```
+
+Line by line:
+
+- `using Microsoft.AspNetCore.SignalR` — gives access to the `Hub` base class and the `Clients` API.
+- `namespace SignalR.Hubs` — folder name becomes the namespace. `Program.cs` uses `using SignalR.Hubs;` to find the class.
+- `public class ChatHub : Hub` — `: Hub` turns this into a server-side endpoint for this connection type. The `Hub` base class provides `Clients`.
+- `public async Task SendMessage(string user, string message)` — any `public` method is callable by the client via `connection.invoke('SendMessage', user, message)`. Non-public methods are not callable. The name maps directly to the JS invoke string.
+- `await Clients.All.SendAsync("ReceiveMessage", user, message)` — the core magic:
+  - `Clients.All` = every connected client (the group of all connections)
+  - `SendAsync("ReceiveMessage", ...)` = invoke the `ReceiveMessage` handler on each client. The string name must match the JS `connection.on('ReceiveMessage', ...)`
+  - `await` = the broadcast is async; returning a `Task` lets the connection know when the send finished
+
+Flow map:
+
+```text
+browser A ──invoke("SendMessage","jo","hi")──▶ ChatHub.SendMessage
+                                                   │
+                                                   ▼ Clients.All.SendAsync("ReceiveMessage","jo","hi")
+browser A ◀──on('ReceiveMessage')──────┘
+browser B ◀──on('ReceiveMessage')───────┘   (both get it)
+```
+
+Three touch points whose names must align:
+
+| Name | Server (Hub) | Client (site.js) |
+|---|---|---|
+| method | `SendMessage` | `invoke('SendMessage')` |
+| broadcast target | `"ReceiveMessage"` | `on('ReceiveMessage')` |
+
+Note: a Hub instance is **per-invocation** — stateless. Each call gets a new instance. Long-lived state (who is connected) needs `ConnectionId`, `Groups`, or `OnConnectedAsync`. That is the next study step.
+
+## Breakdown: `wwwroot/site.js`
+
+```javascript
+const connection = new signalR.HubConnectionBuilder()
+	.withUrl("/chatHub")
+	.configureLogging(signalR.LogLevel.Information)
+	.build()
+
+const form = document.getElementById('message-form')
+const username = document.getElementById('username')
+const message = document.getElementById('message')
+const messages = document.getElementById('messages')
+
+connection.on('ReceiveMessage', (user, text) => {
+	const li = document.createElement('li')
+	li.textContent = `${user}: ${text}`
+	messages.appendChild(li)
+})
+
+form.addEventListener('submit', async (e) => {
+	e.preventDefault()
+	await connection.invoke('SendMessage', username.value, message.value)
+	message.value = ''
+})
+
+connection.start().catch((err) => console.error(err))
+```
+
+Lines 1-4 — connection setup (chainable builder):
+
+- `new signalR.HubConnectionBuilder()` — the `signalR` global comes from the `signalr.min.js` script tag. Builder pattern: configure, then build.
+- `.withUrl("/chatHub")` — the WebSocket/SSE endpoint. Must match `app.MapHub<ChatHub>("/chatHub")` exactly.
+- `.configureLogging(signalR.LogLevel.Information)` — log level to the DevTools console. Info shows reconnects and connection state changes, which helps debugging.
+- `.build()` — freezes the config and returns the connection object (not started yet).
+
+Lines 6-9 — plain DOM element references.
+
+Lines 11-15 — receive side (`.on`):
+
+- `connection.on('ReceiveMessage', (user, text) => ...)` — registers a handler for the broadcast named `"ReceiveMessage"`, which must match the server's `SendAsync("ReceiveMessage", ...)`. It runs whenever the server pushes a message.
+- Builds a `<li>` and appends it to the `<ul>`. No page reload — that is the real-time part.
+
+Lines 17-21 — send side (form submit):
+
+- The `submit` event is used instead of `click`, so Enter works too. The handler is `async` because `invoke` returns a Promise.
+- `e.preventDefault()` stops the browser's default page-reload (form POST).
+- `await connection.invoke('SendMessage', username.value, message.value)` sends to the server. Method name + args map to the hub's `SendMessage(user, message)`.
+- `message.value = ''` clears the input only after the send succeeds.
+
+Line 23 — start (the actual connect):
+
+- `connection.start()` initiates the handshake (negotiate then WebSocket) and returns a Promise. `.catch(...)` shows errors instead of leaving a silently dead page.
+
+Key mental model:
+
+| Direction | Client code | Server code |
+|---|---|---|
+| send | `invoke('SendMessage', ...)` | `SendMessage(user, message)` method |
+| receive | `on('ReceiveMessage', ...)` | `SendAsync("ReceiveMessage", ...)` |
+
+Gotchas:
+
+- Order matters: call `.on()` **before** `.start()`, otherwise early broadcasts are missed.
+- If `.start()` fails the connection is dead silently — that is why `.catch` exists.
+- `invoke` waits for the server method to finish; `send` is fire-and-forget.
+- Register handlers before `start()` resolves to avoid race conditions.
+
 ## Known startup detail from earlier
 
 The project initially hit a `.NET 10` runtime/prune metadata issue during restore/build. The app was still usable after adding:
